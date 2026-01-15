@@ -39,6 +39,7 @@
 #include <math.h>
 #include <string.h>
 #include <AudioTools.h>
+#include "driver/i2s.h"
 
 using namespace audio_tools;
 
@@ -459,6 +460,9 @@ I2SStream i2s;
 enum I2SRole : uint8_t { I2S_NONE=0, I2S_TX, I2S_RX };
 static I2SRole   g_i2sRole = I2S_NONE;
 static uint32_t  g_i2sRate = 0;
+static bool      g_i2sLegacyRxActive = false;
+
+static const i2s_port_t MIC_I2S_PORT = I2S_NUM_0;
 
 static int g_scriptSpeedPct = 100;
 static int g_userSpeedPct   = 100;
@@ -503,7 +507,12 @@ static String speedLabel() {
 static void ensureI2S_TX(uint32_t out_rate_hz) {
   if (g_i2sRole == I2S_TX && g_i2sRate == out_rate_hz) return;
 
-  if (g_i2sRole != I2S_NONE) {
+  if (g_i2sRole == I2S_RX) {
+    if (g_i2sLegacyRxActive) {
+      i2s_driver_uninstall(MIC_I2S_PORT);
+      g_i2sLegacyRxActive = false;
+    }
+  } else if (g_i2sRole != I2S_NONE) {
     i2s.end();
     delay(2);
   }
@@ -529,24 +538,40 @@ static void ensureI2S_TX(uint32_t out_rate_hz) {
 static void ensureI2S_RX(uint32_t in_rate_hz) {
   if (g_i2sRole == I2S_RX && g_i2sRate == in_rate_hz) return;
 
-  if (g_i2sRole != I2S_NONE) {
+  if (g_i2sRole == I2S_TX) {
     i2s.end();
     delay(2);
   }
 
-  auto cfg = i2s.defaultConfig(RX_MODE);
-  cfg.sample_rate     = in_rate_hz;
-  cfg.channels        = REC_I2S_CHANNELS;
-  cfg.bits_per_sample = REC_I2S_BITS_PER_SAMPLE;
-  cfg.i2s_format      = I2S_STD_FORMAT;
-  cfg.pin_bck         = I2S_MIC_BCLK_PIN;
-  cfg.pin_ws          = I2S_MIC_WS_PIN;
-  cfg.pin_data        = I2S_MIC_DIN_PIN;
-  cfg.is_master       = true;
-  cfg.buffer_size     = 1024;
-  cfg.buffer_count    = 8;
+  if (g_i2sLegacyRxActive) {
+    i2s_driver_uninstall(MIC_I2S_PORT);
+    g_i2sLegacyRxActive = false;
+  }
 
-  i2s.begin(cfg);
+  i2s_config_t cfg = {};
+  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+  cfg.sample_rate = in_rate_hz;
+  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
+  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  cfg.communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB);
+  cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  cfg.dma_buf_count = 8;
+  cfg.dma_buf_len = 256;
+  cfg.use_apll = false;
+  cfg.tx_desc_auto_clear = false;
+  cfg.fixed_mclk = 0;
+
+  i2s_pin_config_t pins = {};
+  pins.bck_io_num = I2S_MIC_BCLK_PIN;
+  pins.ws_io_num = I2S_MIC_WS_PIN;
+  pins.data_out_num = I2S_PIN_NO_CHANGE;
+  pins.data_in_num = I2S_MIC_DIN_PIN;
+
+  i2s_driver_install(MIC_I2S_PORT, &cfg, 0, nullptr);
+  i2s_set_pin(MIC_I2S_PORT, &pins);
+  i2s_zero_dma_buffer(MIC_I2S_PORT);
+  g_i2sLegacyRxActive = true;
+
   g_i2sRole = I2S_RX;
   g_i2sRate = in_rate_hz;
   delay(2);
@@ -1641,7 +1666,8 @@ static void serviceRecordingCapture() {
   static uint8_t raw[2048];
   static int16_t mono[512];
 
-  size_t got = i2s.readBytes(raw, sizeof(raw));
+  size_t got = 0;
+  i2s_read(MIC_I2S_PORT, raw, sizeof(raw), &got, pdMS_TO_TICKS(20));
   if (got == 0) return;
 
   int frames = (int)(got / 8);
